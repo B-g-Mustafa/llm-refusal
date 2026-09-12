@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Jupyter / notebooks
+.ipynb_checkpoints/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+logs/
+results/
+out/
+outcomes/
+
+# ML / model artifacts
+checkpoints/
+models/
+model_cache/
+wandb/
+mlruns/
+*.pt
+*.bin
+*.safetensors
+*.ckpt
+*.h5
+
+# Data cache
+.cache/
+cache/
+
+# Environment files
+.env
+.env.*
