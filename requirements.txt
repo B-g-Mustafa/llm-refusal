@@ -1,0 +1,16 @@
+# Core (required)
+torch>=2.3
+transformers>=4.51        # Qwen3 support
+accelerate>=0.30          # device_map="auto"
+numpy>=1.26
+tqdm>=4.66
+
+# Analysis (recommended; code degrades gracefully without them)
+scikit-learn>=1.4         # probe AUROC in directions.py
+scipy>=1.11               # optional; stats.py has a numpy Spearman fallback
+statsmodels>=0.14         # optional; mixed-effects fit in stats.py
+matplotlib>=3.8           # figures in scripts/07_analyze.py
+
+# Data sources for reference/harmful splits
+datasets>=2.19            # Alpaca (reference) and any HF datasets
+colorama>=0.4             # pretty console output (legacy refusal_ablation.py)
