@@ -45,66 +45,94 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    _common.set_seed(args.seed)
-    outdir = _common.results_dir(args.model)
-    alphas = [float(a) for a in args.alphas.split(",")]
-    names = set(args.names.split(","))
+    with _common.script_run("06_interventions", args.model) as log:
+        log(f"args: {vars(args)}")
+        _common.set_seed(args.seed)
+        outdir = _common.results_dir(args.model)
+        alphas = [float(a) for a in args.alphas.split(",")]
+        names = set(args.names.split(","))
 
-    envs = _environments(outdir)
-    lm = load_model(args.model)
-    scorer = refusal.RefusalScorer(lm)
-    layers = modeling.get_layers(lm.model)
+        with _common.stage(log, "build held-out environments"):
+            envs = _environments(outdir)
+            for name, rows in envs.items():
+                log(f"  env '{name}': {len(rows)} rows")
 
-    dirs = [d for d in directions.load_directions(outdir / "directions") if d.name in names]
-    # Add norm-matched random controls at a spread of layers.
-    layer_set = sorted({d.layer_id for d in dirs})
-    for l in layer_set:
-        dirs.append(directions.random_direction(l, lm.model.config.hidden_size, args.seed + l))
+        with _common.stage(log, f"load model {args.model}"):
+            lm = load_model(args.model)
+            scorer = refusal.RefusalScorer(lm)
+            layers = modeling.get_layers(lm.model)
 
-    # Baseline refusal per environment.
-    baseline = {name: scorer.score_rows(rows, args.batch_size).mean() for name, rows in envs.items()}
-    print("Baseline refusal log-odds:", {k: round(float(v), 3) for k, v in baseline.items()})
+        with _common.stage(log, "load directions + random controls"):
+            dirs = [d for d in directions.load_directions(outdir / "directions") if d.name in names]
+            layer_set = sorted({d.layer_id for d in dirs})
+            for l in layer_set:
+                dirs.append(directions.random_direction(l, lm.model.config.hidden_size, args.seed + l))
+            log(f"  {len(dirs)} directions (incl. {len(layer_set)} random controls)")
 
-    records = []
+        with _common.stage(log, "baseline refusal per environment"):
+            baseline = {name: scorer.score_rows(rows, args.batch_size).mean()
+                       for name, rows in envs.items()}
+            log(f"  baseline refusal log-odds: {({k: round(float(v), 3) for k, v in baseline.items()})}")
 
-    def score_env(hooks) -> dict[str, float]:
-        out = {}
-        for name, rows in envs.items():
-            scores = _score_with_hooks(lm, scorer, rows, hooks, args.batch_size)
-            out[name] = float(scores.mean())
-        return out
+        records = []
 
-    # --- cheap operators over ALL directions (feeds C1) ---------------------
-    for d in dirs:
-        # single-layer ablation
-        hooks = [(layers[d.layer_id], interventions.make_ablation_hook(d.vector))]
-        _record(records, d, "ablate_single", baseline, score_env(hooks))
-        # addition (negative = suppress the feature; positive = inject it)
-        for alpha in alphas:
-            for sign, tag in [(-1.0, "add_neg"), (1.0, "add_pos")]:
-                hooks = [(layers[d.layer_id], interventions.make_addition_hook(d.vector, sign * alpha))]
-                _record(records, d, f"{tag}_a{alpha:g}", baseline, score_env(hooks))
+        def score_env(hooks) -> dict[str, float]:
+            out = {}
+            for name, rows in envs.items():
+                scores = _score_with_hooks(lm, scorer, rows, hooks, args.batch_size)
+                out[name] = float(scores.mean())
+            return out
 
-    # --- heavy operators on top candidates per name -------------------------
-    top = _top_candidates(records, names, args.heavy_top)
-    for d in dirs:
-        key = (d.name, d.layer_id, d.position_spec)
-        if key not in top:
-            continue
-        # all-layer ablation (global, single direction applied at every block)
-        hooks = [(block, interventions.make_ablation_hook(d.vector)) for block in layers]
-        _record(records, d, "ablate_all", baseline, score_env(hooks))
-        # weight orthogonalization (destructive; restored right after)
-        restore = interventions.orthogonalize_weights(lm, d.vector)
-        try:
-            _record(records, d, "orthogonalize", baseline,
-                    {name: float(scorer.score_rows(rows, args.batch_size).mean())
-                     for name, rows in envs.items()})
-        finally:
-            restore()
+        # --- cheap operators over ALL directions (feeds C1) -----------------
+        n_cheap_ops = 1 + 2 * len(alphas)
+        total_cheap = len(dirs) * n_cheap_ops
+        with _common.stage(log, f"cheap operators (ablate + addition) over {len(dirs)} directions "
+                                f"x {n_cheap_ops} ops = {total_cheap} cells"):
+            cell_i = 0
+            for d_i, d in enumerate(dirs, start=1):
+                # single-layer ablation
+                hooks = [(layers[d.layer_id], interventions.make_ablation_hook(d.vector))]
+                _record(records, d, "ablate_single", baseline, score_env(hooks))
+                cell_i += 1
+                # addition (negative = suppress the feature; positive = inject it)
+                for alpha in alphas:
+                    for sign, tag in [(-1.0, "add_neg"), (1.0, "add_pos")]:
+                        hooks = [(layers[d.layer_id],
+                                 interventions.make_addition_hook(d.vector, sign * alpha))]
+                        _record(records, d, f"{tag}_a{alpha:g}", baseline, score_env(hooks))
+                        cell_i += 1
+                log.progress(cell_i, total_cheap, every=max(1, total_cheap // 10),
+                            prefix=f"cheap-ops[{d.name} L{d.layer_id}]")
 
-    _common.write_jsonl(records, outdir / "interventions.jsonl")
-    print(f"\nWrote {len(records)} intervention records -> {outdir/'interventions.jsonl'}")
+        # --- heavy operators on top candidates per name ----------------------
+        with _common.stage(log, "select top candidates for heavy operators"):
+            top = _top_candidates(records, names, args.heavy_top)
+            log(f"  top candidates ({len(top)}): {sorted(top)}")
+
+        with _common.stage(log, f"heavy operators (all-layer ablate + orthogonalize) "
+                                f"on {len(top)} candidates"):
+            done = 0
+            for d in dirs:
+                key = (d.name, d.layer_id, d.position_spec)
+                if key not in top:
+                    continue
+                # all-layer ablation (global, single direction applied at every block)
+                hooks = [(block, interventions.make_ablation_hook(d.vector)) for block in layers]
+                _record(records, d, "ablate_all", baseline, score_env(hooks))
+                # weight orthogonalization (destructive; restored right after)
+                restore = interventions.orthogonalize_weights(lm, d.vector)
+                try:
+                    _record(records, d, "orthogonalize", baseline,
+                            {name: float(scorer.score_rows(rows, args.batch_size).mean())
+                             for name, rows in envs.items()})
+                finally:
+                    restore()
+                done += 1
+                log(f"  heavy ops done for {d.name} L{d.layer_id} ({done}/{len(top)})")
+
+        with _common.stage(log, "write interventions.jsonl"):
+            _common.write_jsonl(records, outdir / "interventions.jsonl")
+            log(f"  wrote {len(records)} intervention records -> {outdir/'interventions.jsonl'}")
 
 
 def _record(records, d, operator, baseline, intervened):

@@ -49,56 +49,71 @@ def parse_layers(spec: str, n: int) -> list[int]:
 
 def main() -> None:
     args = parse_args()
-    _common.set_seed(args.seed)
-    outdir = _common.results_dir(args.model)
+    with _common.script_run("05_patching", args.model) as log:
+        log(f"args: {vars(args)}")
+        _common.set_seed(args.seed)
+        outdir = _common.results_dir(args.model)
 
-    all_rows = data.read_prompt_table(_common.DATA_DIR / "prompt_table.jsonl")
-    train_ids = {r["base_id"] for r in _common.read_jsonl(outdir / "train_base_ids.jsonl")}
-    defensive = [r for r in all_rows
-                 if r.base_id not in train_ids and r.task_type == "dual_use_defensive"]
+        with _common.stage(log, "load + align eval pairs"):
+            all_rows = data.read_prompt_table(_common.DATA_DIR / "prompt_table.jsonl")
+            train_ids = {r["base_id"] for r in _common.read_jsonl(outdir / "train_base_ids.jsonl")}
+            defensive = [r for r in all_rows
+                         if r.base_id not in train_ids and r.task_type == "dual_use_defensive"]
+            auth = [r for r in defensive if r.framing == "authorized"]
+            irr = [r for r in defensive if r.framing == "irrelevant_preamble"]
+            auth, irr = _align(auth, irr)
+            if not auth:
+                raise SystemExit("No aligned authorized/irrelevant eval pairs; check stages 01/03.")
+            log(f"  aligned eval pairs: {len(auth)}")
 
-    auth = [r for r in defensive if r.framing == "authorized"]
-    irr = [r for r in defensive if r.framing == "irrelevant_preamble"]
-    auth, irr = _align(auth, irr)
-    if not auth:
-        raise SystemExit("No aligned authorized/irrelevant eval pairs; check stages 01/03.")
-    print(f"Aligned eval pairs: {len(auth)}")
+        with _common.stage(log, f"load model {args.model}"):
+            lm = load_model(args.model)
+            scorer = refusal.RefusalScorer(lm)
+            layer_ids = parse_layers(args.layers, lm.num_layers)
+            log(f"  layers to patch: {layer_ids} x spans: {SPANS} "
+                f"({len(layer_ids) * len(SPANS)} (layer,span) cells)")
 
-    lm = load_model(args.model)
-    scorer = refusal.RefusalScorer(lm)
-    layer_ids = parse_layers(args.layers, lm.num_layers)
+        with _common.stage(log, "baseline refusal scores"):
+            base_auth = scorer.score_rows(auth, batch_size=args.batch_size)
+            base_irr = scorer.score_rows(irr, batch_size=args.batch_size)
+            gap = float(base_auth.mean() - base_irr.mean())
+            log(f"  behavioral gap (authorized - irrelevant): {gap:+.3f}")
 
-    base_auth = scorer.score_rows(auth, batch_size=args.batch_size)
-    base_irr = scorer.score_rows(irr, batch_size=args.batch_size)
-    gap = float(base_auth.mean() - base_irr.mean())
-    print(f"Behavioral gap (authorized - irrelevant): {gap:+.3f}")
+        records = []
+        total_cells = len(SPANS) * len(layer_ids)
+        cell_i = 0
+        for span_i, span in enumerate(SPANS, start=1):
+            with _common.stage(log, f"span '{span}' ({span_i}/{len(SPANS)}): capture donor means"):
+                irr_src = capture.capture_activations(
+                    lm, irr, layer_ids, span, args.batch_size,
+                    on_progress=lambda d, t: log.progress(d, t, every=max(1, t // 3), prefix=f"cap[{span},irr]"))
+                auth_src = capture.capture_activations(
+                    lm, auth, layer_ids, span, args.batch_size,
+                    on_progress=lambda d, t: log.progress(d, t, every=max(1, t // 3), prefix=f"cap[{span},auth]"))
 
-    records = []
-    for span in SPANS:
-        # Per-row source means at each layer for both donors.
-        irr_src = capture.capture_activations(lm, irr, layer_ids, span, args.batch_size)
-        auth_src = capture.capture_activations(lm, auth, layer_ids, span, args.batch_size)
-        for li, layer in enumerate(layer_ids):
-            nec = interventions.patched_refusal_scores(
-                lm, scorer, auth, irr_src[:, li, :], layer, span, args.batch_size)
-            suf = interventions.patched_refusal_scores(
-                lm, scorer, irr, auth_src[:, li, :], layer, span, args.batch_size)
-            nec_recovered = (base_auth.mean() - nec.mean()) / gap if gap else float("nan")
-            suf_recovered = (suf.mean() - base_irr.mean()) / gap if gap else float("nan")
-            rec = {
-                "layer": layer, "span": span, "gap": gap,
-                "necessity_patched_mean": float(nec.mean()),
-                "necessity_frac_recovered": float(nec_recovered),
-                "sufficiency_patched_mean": float(suf.mean()),
-                "sufficiency_frac_recovered": float(suf_recovered),
-            }
-            records.append(rec)
-            print(f"L{layer:>2} {span:>12}: necessity {nec_recovered:5.2f} | "
-                  f"sufficiency {suf_recovered:5.2f} (frac of gap)")
+            for li, layer in enumerate(layer_ids):
+                cell_i += 1
+                nec = interventions.patched_refusal_scores(
+                    lm, scorer, auth, irr_src[:, li, :], layer, span, args.batch_size)
+                suf = interventions.patched_refusal_scores(
+                    lm, scorer, irr, auth_src[:, li, :], layer, span, args.batch_size)
+                nec_recovered = (base_auth.mean() - nec.mean()) / gap if gap else float("nan")
+                suf_recovered = (suf.mean() - base_irr.mean()) / gap if gap else float("nan")
+                rec = {
+                    "layer": layer, "span": span, "gap": gap,
+                    "necessity_patched_mean": float(nec.mean()),
+                    "necessity_frac_recovered": float(nec_recovered),
+                    "sufficiency_patched_mean": float(suf.mean()),
+                    "sufficiency_frac_recovered": float(suf_recovered),
+                }
+                records.append(rec)
+                log(f"cell {cell_i}/{total_cells}  L{layer:>2} {span:>12}: "
+                    f"necessity {nec_recovered:5.2f} | sufficiency {suf_recovered:5.2f} (frac of gap)")
 
-    _common.write_jsonl(records, outdir / "patching.jsonl")
-    print(f"\nWrote {outdir/'patching.jsonl'}. High frac_recovered = that (layer,span) "
-          "carries the authorization effect.")
+        with _common.stage(log, "write patching.jsonl"):
+            _common.write_jsonl(records, outdir / "patching.jsonl")
+            log(f"  wrote {outdir/'patching.jsonl'}. High frac_recovered = that "
+                "(layer,span) carries the authorization effect.")
 
 
 def _align(a_rows, b_rows):

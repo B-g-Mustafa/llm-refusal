@@ -52,82 +52,119 @@ def none_user_rows(base_tasks: list[BaseTask]) -> list[PromptRow]:
     return rows
 
 
+def _cap(lm, rows, layer_ids, pos, batch_size, log, tag):
+    """capture_activations with progress mirrored into the log file."""
+    return capture.capture_activations(
+        lm, rows, layer_ids, pos, batch_size,
+        on_progress=lambda d, t: log.progress(d, t, every=max(1, t // 5), prefix=tag),
+    )
+
+
 def main() -> None:
     args = parse_args()
-    _common.set_seed(args.seed)
-    base_tasks = [BaseTask(**r) for r in _common.read_jsonl(_common.DATA_DIR / "base_tasks.jsonl")]
+    with _common.script_run("03_extract_directions", args.model) as log:
+        log(f"args: {vars(args)}")
+        _common.set_seed(args.seed)
 
-    ids = [t.base_id for t in base_tasks]
-    train_ids, _eval_ids = _common.split_base_ids(ids, args.train_frac, args.seed)
-    train = [t for t in base_tasks if t.base_id in train_ids]
-    _common.write_jsonl([{"base_id": i} for i in sorted(train_ids)],
-                        _common.results_dir(args.model) / "train_base_ids.jsonl")
+        with _common.stage(log, "load base tasks + train/eval split"):
+            base_tasks = [BaseTask(**r) for r in
+                          _common.read_jsonl(_common.DATA_DIR / "base_tasks.jsonl")]
+            ids = [t.base_id for t in base_tasks]
+            train_ids, _eval_ids = _common.split_base_ids(ids, args.train_frac, args.seed)
+            train = [t for t in base_tasks if t.base_id in train_ids]
+            _common.write_jsonl([{"base_id": i} for i in sorted(train_ids)],
+                                _common.results_dir(args.model) / "train_base_ids.jsonl")
+            log(f"  {len(base_tasks)} base tasks -> {len(train)} train / "
+                f"{len(base_tasks) - len(train)} eval")
 
-    lm = load_model(args.model)
-    layer_ids = parse_layers(args.layers, lm.num_layers)
-    print(f"Extracting at layers {layer_ids}")
+        with _common.stage(log, f"load model {args.model}"):
+            lm = load_model(args.model)
+            layer_ids = parse_layers(args.layers, lm.num_layers)
+            log(f"  layers: {lm.num_layers}; extracting at {layer_ids}")
 
-    harmful = [t for t in train if t.task_type == "harmful"]
-    benign = [t for t in train if t.task_type == "benign_neutral"]
-    defensive = [t for t in train if t.task_type == "dual_use_defensive"]
+        harmful = [t for t in train if t.task_type == "harmful"]
+        benign = [t for t in train if t.task_type == "benign_neutral"]
+        defensive = [t for t in train if t.task_type == "dual_use_defensive"]
+        log(f"train pools: harmful={len(harmful)} benign={len(benign)} defensive={len(defensive)}")
 
-    all_dirs: list[directions.Direction] = []
+        all_dirs: list[directions.Direction] = []
 
-    # --- d_harm : harmful vs benign at t_inst -------------------------------
-    if harmful and benign:
-        h_rows, b_rows = none_user_rows(harmful), none_user_rows(benign)
-        h_act = capture.capture_activations(lm, h_rows, layer_ids, "t_inst", args.batch_size)
-        b_act = capture.capture_activations(lm, b_rows, layer_ids, "t_inst", args.batch_size)
-        for li, layer in enumerate(layer_ids):
-            all_dirs.append(directions.diff_in_means_direction(
-                "d_harm", layer, "t_inst", h_act[:, li, :], b_act[:, li, :]))
+        # --- d_harm : harmful vs benign at t_inst ---------------------------
+        if harmful and benign:
+            with _common.stage(log, "extract d_harm (harmful vs benign @ t_inst)"):
+                h_rows, b_rows = none_user_rows(harmful), none_user_rows(benign)
+                h_act = _cap(lm, h_rows, layer_ids, "t_inst", args.batch_size, log, "d_harm[harmful]")
+                b_act = _cap(lm, b_rows, layer_ids, "t_inst", args.batch_size, log, "d_harm[benign]")
+                for li, layer in enumerate(layer_ids):
+                    all_dirs.append(directions.diff_in_means_direction(
+                        "d_harm", layer, "t_inst", h_act[:, li, :], b_act[:, li, :]))
+                log(f"  d_harm directions: {len(layer_ids)}")
+        else:
+            log("SKIP d_harm: empty harmful or benign train pool")
 
-    # --- d_refusal : refused vs answered at post_all ------------------------
-    refused_rows, answered_rows = _refused_answered(lm, harmful + benign, args)
-    if refused_rows and answered_rows:
-        r_act = capture.capture_activations(lm, refused_rows, layer_ids, "post_all", args.batch_size)
-        a_act = capture.capture_activations(lm, answered_rows, layer_ids, "post_all", args.batch_size)
-        for li, layer in enumerate(layer_ids):
-            all_dirs.append(directions.diff_in_means_direction(
-                "d_refusal", layer, "post_all", r_act[:, li, :], a_act[:, li, :]))
+        # --- d_refusal : refused vs answered at post_all --------------------
+        with _common.stage(log, "extract d_refusal (refused vs answered @ post_all)"):
+            refused_rows, answered_rows = _refused_answered(lm, harmful + benign, args, log)
+            if refused_rows and answered_rows:
+                r_act = _cap(lm, refused_rows, layer_ids, "post_all", args.batch_size, log, "d_refusal[refused]")
+                a_act = _cap(lm, answered_rows, layer_ids, "post_all", args.batch_size, log, "d_refusal[answered]")
+                for li, layer in enumerate(layer_ids):
+                    all_dirs.append(directions.diff_in_means_direction(
+                        "d_refusal", layer, "post_all", r_act[:, li, :], a_act[:, li, :]))
+                log(f"  d_refusal directions: {len(layer_ids)}")
+            else:
+                log("  SKIP d_refusal: no refused or no answered rows in baseline generation")
 
-    # --- d_claim : authorized vs irrelevant_preamble on identical tasks -----
-    if defensive:
-        auth = data.build_prompt_table(defensive, families=["authorized"], channels=["user"])
-        irr = data.build_prompt_table(defensive, families=["irrelevant_preamble"], channels=["user"])
-        # Row-align by base task so the contrast is truly paired.
-        auth, irr = _align_by_base(auth, irr)
-        for pos in ["t_inst", "post_all", "last"]:
-            a_act = capture.capture_activations(lm, auth, layer_ids, pos, args.batch_size)
-            i_act = capture.capture_activations(lm, irr, layer_ids, pos, args.batch_size)
-            for li, layer in enumerate(layer_ids):
-                all_dirs.append(directions.diff_in_means_direction(
-                    "d_claim", layer, pos, a_act[:, li, :], i_act[:, li, :], with_svd=True))
+        # --- d_claim : authorized vs irrelevant_preamble on identical tasks -
+        if defensive:
+            with _common.stage(log, "extract d_claim (authorized vs irrelevant_preamble)"):
+                auth = data.build_prompt_table(defensive, families=["authorized"], channels=["user"])
+                irr = data.build_prompt_table(defensive, families=["irrelevant_preamble"], channels=["user"])
+                auth, irr = _align_by_base(auth, irr)
+                log(f"  aligned pairs: {len(auth)}")
+                for pos in ["t_inst", "post_all", "last"]:
+                    a_act = _cap(lm, auth, layer_ids, pos, args.batch_size, log, f"d_claim[{pos},auth]")
+                    i_act = _cap(lm, irr, layer_ids, pos, args.batch_size, log, f"d_claim[{pos},irr]")
+                    for li, layer in enumerate(layer_ids):
+                        all_dirs.append(directions.diff_in_means_direction(
+                            "d_claim", layer, pos, a_act[:, li, :], i_act[:, li, :], with_svd=True))
+                    log(f"  d_claim[{pos}] directions: {len(layer_ids)}")
+        else:
+            log("SKIP d_claim: empty defensive train pool")
 
-    # --- d_persuasion : persuasion vs matched control wrappers --------------
-    persuasion_rows, control_rows = _persuasion_rows(harmful + defensive)
-    if persuasion_rows:
-        p_act = capture.capture_activations(lm, persuasion_rows, layer_ids, "post_all", args.batch_size)
-        c_act = capture.capture_activations(lm, control_rows, layer_ids, "post_all", args.batch_size)
-        for li, layer in enumerate(layer_ids):
-            all_dirs.append(directions.diff_in_means_direction(
-                "d_persuasion", layer, "post_all", p_act[:, li, :], c_act[:, li, :]))
+        # --- d_persuasion : persuasion vs matched control wrappers ----------
+        with _common.stage(log, "extract d_persuasion (persuasion vs matched control)"):
+            persuasion_rows, control_rows = _persuasion_rows(harmful + defensive)
+            if persuasion_rows:
+                p_act = _cap(lm, persuasion_rows, layer_ids, "post_all", args.batch_size, log, "d_persuasion[persuasion]")
+                c_act = _cap(lm, control_rows, layer_ids, "post_all", args.batch_size, log, "d_persuasion[control]")
+                for li, layer in enumerate(layer_ids):
+                    all_dirs.append(directions.diff_in_means_direction(
+                        "d_persuasion", layer, "post_all", p_act[:, li, :], c_act[:, li, :]))
+                log(f"  d_persuasion directions: {len(layer_ids)}")
+            else:
+                log("  SKIP d_persuasion: no persuasion rows built")
 
-    outpath = _common.results_dir(args.model) / "directions"
-    directions.save_directions(all_dirs, outpath)
-    print(f"Saved {len(all_dirs)} directions to {outpath}.npz")
+        with _common.stage(log, "save directions"):
+            outpath = _common.results_dir(args.model) / "directions"
+            directions.save_directions(all_dirs, outpath)
+            log(f"  saved {len(all_dirs)} directions -> {outpath}.npz")
 
 
-def _refused_answered(lm, tasks, args):
+def _refused_answered(lm, tasks, args, log):
     """Baseline-generate on `none/user` rows, judge, split into refused/answered."""
     rows = none_user_rows(tasks)
     if not rows:
         return [], []
-    completions = refusal.generate(lm, rows, max_new_tokens=args.gen_max_new, batch_size=4)
+    completions = refusal.generate(
+        lm, rows, max_new_tokens=args.gen_max_new, batch_size=4,
+        on_progress=lambda d, t: log.progress(d, t, every=max(1, t // 5), prefix="baseline-generate"),
+    )
     judged = judge.judge_completions(rows, completions)
     refused = [row for row, j in zip(rows, judged) if j.is_refusal]
     answered = [row for row, j in zip(rows, judged) if not j.is_refusal]
-    print(f"d_refusal pool: {len(refused)} refused, {len(answered)} answered")
+    log(f"  d_refusal pool: {len(refused)} refused, {len(answered)} answered "
+        f"(out of {len(rows)} baseline generations)")
     return refused, answered
 
 

@@ -34,39 +34,46 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    _common.set_seed(args.seed)
+    with _common.script_run("01_build_dataset") as log:
+        _common.set_seed(args.seed)
+        log(f"args: {vars(args)}")
 
-    base_tasks = data.authored_base_tasks()
-    if not args.no_harmful:
-        base_tasks += data.load_harmful_base_tasks(args.harmful_size)
-    else:
-        print("Skipping harmful items (--no-harmful); benign-only table.")
+        with _common.stage(log, "load base tasks"):
+            base_tasks = data.authored_base_tasks()
+            log(f"  authored (benign_neutral + dual_use_defensive): {len(base_tasks)}")
+            if not args.no_harmful:
+                harmful = data.load_harmful_base_tasks(args.harmful_size)
+                base_tasks += harmful
+                log(f"  loaded harmful (HarmBench/AdvBench fallback): {len(harmful)}")
+            else:
+                log("  --no-harmful set: skipping network download; benign-only table.")
 
-    data.write_jsonl(base_tasks, _common.DATA_DIR / "base_tasks.jsonl")
-    print(f"Base tasks: {len(base_tasks)}")
+        with _common.stage(log, "write base_tasks.jsonl"):
+            data.write_jsonl(base_tasks, _common.DATA_DIR / "base_tasks.jsonl")
+            log(f"  base tasks total: {len(base_tasks)}")
 
-    # Full grid for the main experiments.
-    full = data.build_prompt_table(base_tasks)
-    data.write_jsonl(full, _common.DATA_DIR / "prompt_table.jsonl")
-    print(f"Full prompt table rows: {len(full)}")
+        with _common.stage(log, "build + write full prompt_table.jsonl"):
+            full = data.build_prompt_table(base_tasks)
+            data.write_jsonl(full, _common.DATA_DIR / "prompt_table.jsonl")
+            log(f"  full prompt table rows: {len(full)}")
 
-    # Gate subset: a handful of base tasks per type, six diagnostic framings,
-    # user channel only, so Gate 1 is quick and interpretable.
-    gate_families = ["none", "authorized", "not_authorized", "role_claim",
-                     "institutional", "irrelevant_preamble"]
-    by_type: dict[str, list] = {}
-    for task in base_tasks:
-        by_type.setdefault(task.task_type, []).append(task)
-    gate_tasks = []
-    for tasks in by_type.values():
-        gate_tasks.extend(tasks[: args.gate_per_type])
-    gate = data.build_prompt_table(gate_tasks, families=gate_families, channels=["user"])
-    data.write_jsonl(gate, _common.DATA_DIR / "gate_table.jsonl")
-    print(f"Gate table rows: {len(gate)} over {len(gate_tasks)} base tasks")
+        with _common.stage(log, "build + write gate_table.jsonl"):
+            # Gate subset: a handful of base tasks per type, six diagnostic
+            # framings, user channel only, so Gate 1 is quick and interpretable.
+            gate_families = ["none", "authorized", "not_authorized", "role_claim",
+                             "institutional", "irrelevant_preamble"]
+            by_type: dict[str, list] = {}
+            for task in base_tasks:
+                by_type.setdefault(task.task_type, []).append(task)
+            gate_tasks = []
+            for tasks in by_type.values():
+                gate_tasks.extend(tasks[: args.gate_per_type])
+            gate = data.build_prompt_table(gate_tasks, families=gate_families, channels=["user"])
+            data.write_jsonl(gate, _common.DATA_DIR / "gate_table.jsonl")
+            log(f"  gate table rows: {len(gate)} over {len(gate_tasks)} base tasks")
 
-    # Report the cell layout so the design is auditable at a glance.
-    print("\nFraming families:", ", ".join(templates.FRAMING_FAMILIES))
-    print("Channels:", ", ".join(templates.CHANNELS))
+        log(f"framing families: {', '.join(templates.FRAMING_FAMILIES)}")
+        log(f"channels: {', '.join(templates.CHANNELS)}")
 
 
 if __name__ == "__main__":

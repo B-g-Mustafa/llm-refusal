@@ -105,13 +105,14 @@ def patched_refusal_scores(
     span_name: str,
     batch_size: int = 8,
     enable_thinking: bool = False,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> np.ndarray:
     """First-token refusal log-odds for ``target_rows`` with a patched span.
 
     ``source_vectors[i]`` (shape ``[d_model]``) overwrites the residual input to
     ``layer_id`` at the ``span_name`` positions of ``target_rows[i]``. Mean
     patching (one source vector per row) sidesteps length mismatches between the
-    donor and recipient framings.
+    donor and recipient framings. ``on_progress`` fires after every batch.
     """
     layers = modeling.get_layers(lm.model)
     ref = torch.tensor(scorer.refusal_ids)
@@ -151,4 +152,6 @@ def patched_refusal_scores(
         r = torch.logsumexp(log_probs[:, ref], dim=-1)
         c = torch.logsumexp(log_probs[:, com], dim=-1)
         out[start : start + len(batch)] = (r - c).numpy()
+        if on_progress is not None:
+            on_progress(min(start + batch_size, len(target_rows)), len(target_rows))
     return out

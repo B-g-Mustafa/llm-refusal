@@ -37,47 +37,65 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    _common.set_seed(args.seed)
-    outdir = _common.results_dir(args.model)
+    with _common.script_run("04_projection_tests", args.model) as log:
+        log(f"args: {vars(args)}")
+        _common.set_seed(args.seed)
+        outdir = _common.results_dir(args.model)
 
-    all_rows = data.read_prompt_table(_common.DATA_DIR / "prompt_table.jsonl")
-    train_ids = {r["base_id"] for r in _common.read_jsonl(outdir / "train_base_ids.jsonl")}
-    eval_rows = [r for r in all_rows if r.base_id not in train_ids]
-    print(f"Eval rows (held-out base tasks): {len(eval_rows)}")
+        with _common.stage(log, "load held-out eval rows"):
+            all_rows = data.read_prompt_table(_common.DATA_DIR / "prompt_table.jsonl")
+            train_ids = {r["base_id"] for r in _common.read_jsonl(outdir / "train_base_ids.jsonl")}
+            eval_rows = [r for r in all_rows if r.base_id not in train_ids]
+            log(f"  eval rows (held-out base tasks): {len(eval_rows)}")
 
-    dirs = directions.load_directions(outdir / "directions")
-    positions = sorted({d.position_spec for d in dirs})
+        with _common.stage(log, "load directions"):
+            dirs = directions.load_directions(outdir / "directions")
+            positions = sorted({d.position_spec for d in dirs})
+            log(f"  {len(dirs)} directions across position specs: {positions}")
 
-    lm = load_model(args.model)
-    scorer = refusal.RefusalScorer(lm)
-    refusal_scores = scorer.score_rows(eval_rows, batch_size=args.batch_size,
-                                       enable_thinking=args.thinking)
+        with _common.stage(log, f"load model {args.model}"):
+            lm = load_model(args.model)
 
-    layer_ids = sorted({d.layer_id for d in dirs})
-    layer_index = {l: i for i, l in enumerate(layer_ids)}
+        with _common.stage(log, "score refusal log-odds on eval rows"):
+            scorer = refusal.RefusalScorer(lm)
+            refusal_scores = scorer.score_rows(
+                eval_rows, batch_size=args.batch_size, enable_thinking=args.thinking,
+                on_progress=lambda d, t: log.progress(d, t, every=max(1, t // 10), prefix="score"),
+            )
 
-    records = [dict(r.__dict__) for r in eval_rows]
-    for i, s in enumerate(refusal_scores):
-        records[i]["refusal_logodds"] = float(s)
+        layer_ids = sorted({d.layer_id for d in dirs})
+        layer_index = {l: i for i, l in enumerate(layer_ids)}
 
-    # Capture once per position spec, then project every direction at that spec.
-    for pos in positions:
-        acts = capture.capture_activations(lm, eval_rows, layer_ids, pos,
-                                           batch_size=args.batch_size,
-                                           enable_thinking=args.thinking)
-        for d in dirs:
-            if d.position_spec != pos:
-                continue
-            li = layer_index[d.layer_id]
-            proj = acts[:, li, :] @ d.vector
-            col = f"proj|{d.name}|L{d.layer_id}|{d.position_spec}"
-            for i, value in enumerate(proj):
-                records[i][col] = float(value)
+        records = [dict(r.__dict__) for r in eval_rows]
+        for i, s in enumerate(refusal_scores):
+            records[i]["refusal_logodds"] = float(s)
 
-    _common.write_jsonl(records, outdir / "projections.jsonl")
-    print(f"Wrote projections for {len(records)} rows -> {outdir/'projections.jsonl'}")
-    print("Stage 07 will test which direction's projection shift under `authorized` "
-          "explains the refusal increase (H1 vs H2/H3).")
+        # Capture once per position spec, then project every direction at that spec.
+        for pos_i, pos in enumerate(positions, start=1):
+            with _common.stage(log, f"capture + project @ {pos} ({pos_i}/{len(positions)})"):
+                acts = capture.capture_activations(
+                    lm, eval_rows, layer_ids, pos,
+                    batch_size=args.batch_size, enable_thinking=args.thinking,
+                    on_progress=lambda d, t: log.progress(d, t, every=max(1, t // 5), prefix=f"capture[{pos}]"),
+                )
+                n_dirs_here = 0
+                for d in dirs:
+                    if d.position_spec != pos:
+                        continue
+                    li = layer_index[d.layer_id]
+                    proj = acts[:, li, :] @ d.vector
+                    col = f"proj|{d.name}|L{d.layer_id}|{d.position_spec}"
+                    for i, value in enumerate(proj):
+                        records[i][col] = float(value)
+                    n_dirs_here += 1
+                log(f"  projected {n_dirs_here} directions at position {pos}")
+
+        with _common.stage(log, "write projections.jsonl"):
+            _common.write_jsonl(records, outdir / "projections.jsonl")
+            log(f"  wrote projections for {len(records)} rows -> {outdir/'projections.jsonl'}")
+
+        log("Stage 07 will test which direction's projection shift under `authorized` "
+            "explains the refusal increase (H1 vs H2/H3).")
 
 
 if __name__ == "__main__":

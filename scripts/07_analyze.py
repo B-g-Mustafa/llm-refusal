@@ -44,29 +44,52 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    outdir = _common.results_dir(args.model)
-    andir = outdir / "analysis"
-    andir.mkdir(parents=True, exist_ok=True)
-    summary: dict = {"model": args.model}
+    with _common.script_run("07_analyze", args.model) as log:
+        log(f"args: {vars(args)}")
+        outdir = _common.results_dir(args.model)
+        andir = outdir / "analysis"
+        andir.mkdir(parents=True, exist_ok=True)
+        summary: dict = {"model": args.model}
 
-    interventions = _maybe(outdir / "interventions.jsonl")
-    projections = _maybe(outdir / "projections.jsonl")
-    patching = _maybe(outdir / "patching.jsonl")
+        with _common.stage(log, "load upstream result files"):
+            interventions = _maybe(outdir / "interventions.jsonl")
+            projections = _maybe(outdir / "projections.jsonl")
+            patching = _maybe(outdir / "patching.jsonl")
+            log(f"  interventions.jsonl: {len(interventions) if interventions else 'MISSING'}")
+            log(f"  projections.jsonl:   {len(projections) if projections else 'MISSING'}")
+            log(f"  patching.jsonl:      {len(patching) if patching else 'MISSING'}")
 
-    if interventions:
-        summary["C1_geometry_vs_causality"] = _c1(interventions, andir, args.seed)
-        summary["C3_operator_protocol"] = _c3(interventions, andir)
-        summary["C4_cpcv"] = _c4(interventions)
-        summary["tradeoff"] = _tradeoff(interventions)
-    if projections:
-        summary["C2_construction"] = _c2(projections, interventions, andir)
-    if patching:
-        summary["patching_peak"] = _patch_peak(patching)
+        if interventions:
+            with _common.stage(log, "C1: geometry vs. causality"):
+                summary["C1_geometry_vs_causality"] = _c1(interventions, andir, args.seed)
+            with _common.stage(log, "C3: operator x protocol"):
+                summary["C3_operator_protocol"] = _c3(interventions, andir)
+            with _common.stage(log, "C4: CPCV ranking"):
+                summary["C4_cpcv"] = _c4(interventions)
+            with _common.stage(log, "safety-utility trade-off"):
+                summary["tradeoff"] = _tradeoff(interventions)
+        else:
+            log("SKIP C1/C3/C4/tradeoff: interventions.jsonl missing (run stage 06 first)")
 
-    (andir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    _write_markdown(summary, andir / "summary.md")
-    print(f"\nWrote {andir/'summary.md'} and figures in {andir}")
-    print(json.dumps(summary, indent=2)[:2000])
+        if projections:
+            with _common.stage(log, "C2: construction changes the estimand"):
+                summary["C2_construction"] = _c2(projections, interventions, andir)
+        else:
+            log("SKIP C2: projections.jsonl missing (run stage 04 first)")
+
+        if patching:
+            with _common.stage(log, "patching peak"):
+                summary["patching_peak"] = _patch_peak(patching)
+        else:
+            log("SKIP patching_peak: patching.jsonl missing (run stage 05 first)")
+
+        with _common.stage(log, "write summary.json + summary.md"):
+            (andir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+            _write_markdown(summary, andir / "summary.md")
+            log(f"  wrote {andir/'summary.md'} and figures in {andir}")
+
+        log("summary (first 2000 chars):")
+        log(json.dumps(summary, indent=2)[:2000])
 
 
 def _maybe(path: Path):

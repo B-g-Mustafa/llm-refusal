@@ -45,6 +45,39 @@ python scripts/07_analyze.py --model qwen3-14b
 Repeat 3–7 per model. Stage 02 also accepts `--thinking` (Qwen3) and
 `--table prompt_table.jsonl` for the full grid.
 
+## Running on a PBS/qsub cluster (e.g. NSCC)
+
+Use `pbs/` instead of calling the scripts directly. **Edit `pbs/env.sh` first**
+(project code, queue name, repo path, conda env — every `CHANGE_ME` in
+`pbs/*.pbs` and `pbs/env.sh`).
+
+```bash
+# 1. Gate 1: submits stage 01 once, then stage 02 per model (afterok stage 01).
+pbs/submit_gate.sh qwen3-14b llama3.1-8b
+
+# 2. Read the verdict once the jobs finish:
+tail -n 30 logs/02_behavioral_gate_qwen3-14b.log
+
+# 3. Only for models where Gate 1 passed, chain 03 -> 04 -> 05 -> 06 -> 07:
+pbs/submit_mechanistic.sh qwen3-14b
+```
+
+Each `.pbs` file can also be `qsub`'d directly with `-v MODEL=<key>` (and
+`LAYERS=`, `ALPHAS=`, `HEAVY_TOP=`, `THINKING=1` as needed) if you'd rather
+control dependencies yourself.
+
+**Why two log locations.** `system-logs/` is where PBS writes its own
+`*.o<jobid>` / `*.e<jobid>` output — on this cluster that file is only flushed
+to disk once the *entire* job finishes, so `tail -f` on it shows nothing while
+a job is running. `logs/<script>[_<model>].log` is written by the Python
+scripts themselves (`scripts/_common.py`'s `ProgressLogger`): every major step
+and every batch-progress tick is fsync'd to that file immediately, so
+`tail -f logs/06_interventions_qwen3-14b.log` shows live progress regardless of
+how the scheduler buffers its own output. If a stage fails or is killed
+(OOM, walltime), the failure and a full traceback are written to its `logs/`
+file before the process exits, even though `system-logs/` may show nothing
+useful.
+
 ## What each stage produces
 
 | Stage | Output | Answers |
@@ -64,3 +97,6 @@ Repeat 3–7 per model. Stage 02 also accepts `--thinking` (Qwen3) and
 - All CIs are base-task-clustered bootstraps; extraction and evaluation never
   share base tasks (`scripts/_common.split_base_ids`).
 - Harmful prompts are loaded from HarmBench/AdvBench at runtime, never authored here.
+- Every script writes its own live progress log to `logs/<script>[_<model>].log`
+  (see "Running on a PBS/qsub cluster" above) — `tail -f` it to watch a running
+  job. A crash or kill leaves a `FAILED ... ` line with a full traceback there.

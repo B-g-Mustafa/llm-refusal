@@ -29,6 +29,7 @@ Thumbs.db
 *.tmp
 *.bak
 logs/
+system-logs/
 results/
 out/
 outcomes/

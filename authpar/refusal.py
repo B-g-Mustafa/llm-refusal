@@ -21,6 +21,8 @@ judged label (PLAN.md metric-validity gate).
 
 from __future__ import annotations
 
+from typing import Callable
+
 import numpy as np
 import torch
 from tqdm import tqdm
@@ -68,8 +70,14 @@ class RefusalScorer:
         rows: list,
         batch_size: int = 8,
         enable_thinking: bool = False,
+        on_progress: Callable[[int, int], None] | None = None,
     ) -> np.ndarray:
-        """Return refusal log-odds for each row (higher = more refusal-inclined)."""
+        """Return refusal log-odds for each row (higher = more refusal-inclined).
+
+        ``on_progress(rows_done, rows_total)`` fires after every batch (see
+        :func:`authpar.capture.capture_activations` for why this exists
+        alongside tqdm).
+        """
         scores = np.zeros(len(rows), dtype=np.float32)
         ref = torch.tensor(self.refusal_ids)
         com = torch.tensor(self.compliance_ids)
@@ -87,6 +95,8 @@ class RefusalScorer:
             r = torch.logsumexp(log_probs[:, ref], dim=-1)
             c = torch.logsumexp(log_probs[:, com], dim=-1)
             scores[start : start + len(batch)] = (r - c).numpy()
+            if on_progress is not None:
+                on_progress(min(start + batch_size, len(rows)), len(rows))
         return scores
 
 
@@ -98,12 +108,16 @@ def generate(
     batch_size: int = 4,
     enable_thinking: bool = False,
     hooks: list | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> list[str]:
     """Greedy completions for a subset, optionally under intervention ``hooks``.
 
     ``hooks`` is a list of ``(layer_module, forward_pre_hook)`` already suited to
     the model; they are registered for the duration of generation and removed in
-    a finally block (reversible, matching refusal_ablation.py).
+    a finally block (reversible, matching refusal_ablation.py). ``on_progress``
+    fires after every batch; generation is the slowest per-row operation in the
+    pipeline (many forward passes per row), so this is the callback most worth
+    wiring to a log file.
     """
     handles = []
     if hooks:
@@ -130,6 +144,8 @@ def generate(
             completions.extend(
                 lm.tokenizer.batch_decode(new_tokens, skip_special_tokens=True)
             )
+            if on_progress is not None:
+                on_progress(min(start + batch_size, len(rows)), len(rows))
     finally:
         for handle in handles:
             handle.remove()

@@ -69,12 +69,18 @@ def capture_activations(
     position_spec: str,
     batch_size: int = 8,
     enable_thinking: bool = False,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> np.ndarray:
     """Capture residual-stream inputs at ``position_spec`` for each row.
 
     Returns ``[n_rows, n_layers, d_model]`` float32 (CPU numpy). When
     ``position_spec`` resolves to several positions in a row, their mean is taken,
     which is how we realize span means such as the post-instruction region.
+
+    ``on_progress(rows_done, rows_total)`` is called after every batch, in
+    addition to the tqdm bar, so a caller can mirror progress into a log file
+    that is readable while the job is still running (tqdm alone only flushes
+    reliably to an interactive terminal, not to a scheduler's captured log).
     """
     layers = modeling.get_layers(lm.model)
     d_model = lm.model.config.hidden_size
@@ -110,4 +116,7 @@ def capture_activations(
                 padded = [offset + p for p in positions]
                 vec = hidden[bi, padded, :].to(torch.float32).mean(dim=0)
                 out[start + bi, li, :] = vec.cpu().numpy()
+
+        if on_progress is not None:
+            on_progress(min(start + batch_size, len(rows)), len(rows))
     return out
